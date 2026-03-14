@@ -64,8 +64,10 @@
 curl -fsSL https://openclaw.ai/install.sh | bash
 openclaw onboard --install-daemon
 
-# 2. 安装 Claude Code
-npm install -g @anthropic-ai/claude-code
+# 2. 安装 Claude Code（官方推荐方式，无需 Node.js）
+curl -fsSL https://claude.ai/install.sh | bash
+# 安装完成后登录（团队号用户选择团队账号即可，无需单独配 API key）
+claude
 ```
 
 ### 集成方式
