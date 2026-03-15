@@ -157,6 +157,12 @@ openclaw status
 # 安装 Claude Code（官方推荐方式）
 curl -fsSL https://claude.ai/install.sh | bash
 
+# ⚠️ 安装后可能提示 ~/.local/bin 不在 PATH 中，需要手动添加：
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+
+# 验证安装
+claude --version
+
 # 首次启动，进行 OAuth 登录
 claude
 
@@ -197,11 +203,12 @@ mkdir -p ~/.openclaw
 nano ~/.openclaw/openclaw.json
 ```
 
-写入以下内容：
+在已有配置的 `plugins` 部分中，添加 `allow` 白名单和 `claude-code` 的 `config` 块：
 
 ```json
 {
   "plugins": {
+    "allow": ["claude-code", "telegram"],
     "entries": {
       "claude-code": {
         "enabled": true,
@@ -281,6 +288,10 @@ mkdir test-project && cd test-project
 git init
 npm init -y
 
+# ⚠️ VM 全新环境需要配置 git 身份（否则无法 commit）
+git config --global user.email "you@example.com"
+git config --global user.name "Your Name"
+
 # 创建一个简单的文件让 Claude Code 去修改
 cat > index.js << 'EOF'
 // TODO: 实现一个函数，接收数组，返回去重后的数组
@@ -309,37 +320,46 @@ test('无重复', () => {
 EOF
 
 npm install --save-dev jest
+
+# 修改 package.json 的 test 脚本（npx json 首次运行会提示安装，输入 y 确认）
 npx json -I -f package.json -e 'this.scripts.test="jest"'
+
 git add -A && git commit -m "init: test project for openclaw integration"
 ```
 
 **通过 OpenClaw 下发任务：**
 
+> **重要**：OpenClaw 没有 `openclaw run` 命令。插件工具（如 `claude_code_start`）是提供给 OpenClaw agent 使用的，需要通过向 agent 发消息来触发。
+
+有三种方式下发任务：
+
+**方式 A：通过 Telegram（推荐，最直观）**
+
+直接在 Telegram 中给你的 OpenClaw bot 发消息：
+
+> 请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。
+
+**方式 B：通过 CLI**
+
 ```bash
-# 使用 claude_code_start 工具下发编码任务
-# OpenClaw 会创建一个容器，在其中运行 Claude Code
-openclaw run --plugin claude-code --tool claude_code_start \
-  --input '{
-    "workspace": "~/.openclaw/workspaces/test-project",
-    "prompt": "请实现 index.js 中的 uniqueArray 函数，使所有测试通过。运行 npm test 验证。",
-    "allowed_tools": ["read", "edit", "bash"]
+openclaw agent --agent main --message "请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
+```
+
+**方式 C：通过 Gateway API（适合脚本调用）**
+
+```bash
+# Gateway 运行在本地端口（默认 18789），使用配置中的 token 认证
+GATEWAY_TOKEN="your-gateway-auth-token"
+
+curl -s -X POST http://localhost:18789/api/v1/agent/main/message \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
+  -d '{
+    "message": "请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
   }'
-
-# 会返回一个 job_id，记录下来
-# 例如：job_id = "abc123"
 ```
 
-**查看任务状态：**
-
-```bash
-# 查看状态
-openclaw run --plugin claude-code --tool claude_code_status \
-  --input '{"job_id": "abc123"}'
-
-# 查看输出
-openclaw run --plugin claude-code --tool claude_code_output \
-  --input '{"job_id": "abc123"}'
-```
+> Gateway API 的具体端点和格式请参考 `openclaw gateway --help` 和 [OpenClaw 文档](https://docs.openclaw.ai/cli)。上述为示例，实际端点可能略有不同。
 
 **手动验证结果：**
 
@@ -412,38 +432,37 @@ chmod +x scripts/verify.sh
 
 ```python
 # orchestrate_v02.py - v0.2 编排脚本
+# 通过 openclaw agent CLI 或 Gateway API 下发任务给 OpenClaw agent，
+# agent 会自动调用 claude_code_start 插件工具执行编码。
 import subprocess
 import json
+import time
 
-def claude_code_execute(workspace, prompt):
-    """调用 claude-code 插件执行任务，返回 job_id"""
+# ---- 配置 ----
+AGENT_ID = "main"
+GATEWAY_PORT = 18789
+GATEWAY_TOKEN = "your-gateway-auth-token"  # 从 openclaw.json 的 gateway.auth.token 获取
+
+def send_to_agent(message):
+    """通过 CLI 向 OpenClaw agent 发送消息，返回 agent 回复"""
     result = subprocess.run([
-        "openclaw", "run",
-        "--plugin", "claude-code",
-        "--tool", "claude_code_start",
-        "--input", json.dumps({
-            "workspace": workspace,
-            "prompt": prompt,
-            "allowed_tools": ["read", "edit", "bash"]
-        })
-    ], capture_output=True, text=True)
-    return json.loads(result.stdout).get("job_id")
+        "openclaw", "agent",
+        "--agent", AGENT_ID,
+        "--message", message,
+        "--json"  # 如果支持 JSON 输出
+    ], capture_output=True, text=True, timeout=600)
+    return result.stdout
 
-def wait_for_completion(job_id, timeout=300):
-    """轮询等待任务完成"""
-    import time
-    for _ in range(timeout // 5):
-        result = subprocess.run([
-            "openclaw", "run",
-            "--plugin", "claude-code",
-            "--tool", "claude_code_status",
-            "--input", json.dumps({"job_id": job_id})
-        ], capture_output=True, text=True)
-        status = json.loads(result.stdout)
-        if status.get("state") in ("completed", "failed"):
-            return status
-        time.sleep(5)
-    return {"state": "timeout"}
+def send_to_agent_via_api(message):
+    """通过 Gateway API 向 agent 发送消息（备选方案）"""
+    result = subprocess.run([
+        "curl", "-s", "-X", "POST",
+        f"http://localhost:{GATEWAY_PORT}/api/v1/agent/{AGENT_ID}/message",
+        "-H", "Content-Type: application/json",
+        "-H", f"Authorization: Bearer {GATEWAY_TOKEN}",
+        "-d", json.dumps({"message": message})
+    ], capture_output=True, text=True, timeout=600)
+    return result.stdout
 
 def run_verification(project_dir):
     """运行独立验收脚本"""
@@ -454,18 +473,19 @@ def run_verification(project_dir):
     return result.returncode == 0, result.stdout
 
 # ---- 主流程 ----
-workspace = "~/.openclaw/workspaces/test-project"
-task_prompt = "请实现 index.js 中的 uniqueArray 函数，使所有测试通过。"
+workspace = "/home/xiubao_li/.openclaw/workspaces/test-project"
+task_prompt = (
+    f"请使用 claude_code_start 工具，"
+    f"在 {workspace} 中实现 index.js 的 uniqueArray 函数，"
+    f"使 npm test 通过。"
+)
 
-# 1. 下发任务
-job_id = claude_code_execute(workspace, task_prompt)
-print(f"任务已下发，job_id: {job_id}")
+# 1. 下发任务（通过 agent CLI）
+print("下发任务中...")
+response = send_to_agent(task_prompt)
+print(f"Agent 回复: {response}")
 
-# 2. 等待完成
-status = wait_for_completion(job_id)
-print(f"任务状态: {status['state']}")
-
-# 3. 独立验收
+# 2. 独立验收
 passed, output = run_verification(workspace)
 print(output)
 if passed:
@@ -473,6 +493,8 @@ if passed:
 else:
     print("❌ 验收失败，需要回修")
 ```
+
+> **说明**：OpenClaw 的插件工具是由 agent 内部调用的，外部脚本只需向 agent 发送自然语言消息，agent 会自行决定调用 `claude_code_start` 等工具。Gateway API 的具体端点格式请参考 `openclaw gateway --help`。
 
 **v0.2 通过标准**：验收脚本能独立判断任务是否完成，不依赖 Claude Code 的输出。
 
@@ -489,33 +511,16 @@ import json
 import time
 
 MAX_RETRIES = 3
+AGENT_ID = "main"
 
-def claude_code_execute(workspace, prompt):
+def send_to_agent(message):
+    """通过 CLI 向 OpenClaw agent 发送消息"""
     result = subprocess.run([
-        "openclaw", "run",
-        "--plugin", "claude-code",
-        "--tool", "claude_code_start",
-        "--input", json.dumps({
-            "workspace": workspace,
-            "prompt": prompt,
-            "allowed_tools": ["read", "edit", "bash"]
-        })
-    ], capture_output=True, text=True)
-    return json.loads(result.stdout).get("job_id")
-
-def wait_for_completion(job_id, timeout=300):
-    for _ in range(timeout // 5):
-        result = subprocess.run([
-            "openclaw", "run",
-            "--plugin", "claude-code",
-            "--tool", "claude_code_status",
-            "--input", json.dumps({"job_id": job_id})
-        ], capture_output=True, text=True)
-        status = json.loads(result.stdout)
-        if status.get("state") in ("completed", "failed"):
-            return status
-        time.sleep(5)
-    return {"state": "timeout"}
+        "openclaw", "agent",
+        "--agent", AGENT_ID,
+        "--message", message
+    ], capture_output=True, text=True, timeout=600)
+    return result.stdout
 
 def run_verification(project_dir):
     result = subprocess.run(
@@ -526,22 +531,17 @@ def run_verification(project_dir):
 
 def execute_with_retry(workspace, task_description):
     """带回修循环的任务执行"""
-    prompt = task_description
+    prompt = (
+        f"请使用 claude_code_start 工具，在 {workspace} 中完成以下任务：\n"
+        f"{task_description}"
+    )
 
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n--- 第 {attempt}/{MAX_RETRIES} 轮 ---")
 
-        # 执行
-        job_id = claude_code_execute(workspace, prompt)
-        print(f"job_id: {job_id}")
-
-        status = wait_for_completion(job_id)
-        print(f"执行状态: {status['state']}")
-
-        if status["state"] == "failed":
-            print("⚠️ Claude Code 执行失败")
-            prompt = f"上一轮执行失败。原始任务：{task_description}。请重试。"
-            continue
+        # 通过 agent 下发任务
+        response = send_to_agent(prompt)
+        print(f"Agent 回复: {response[:200]}...")
 
         # 独立验收
         passed, output = run_verification(workspace)
@@ -553,6 +553,7 @@ def execute_with_retry(workspace, task_description):
             print(f"❌ 第 {attempt} 轮验收失败")
             # 将失败信息作为反馈，构造回修 prompt
             prompt = (
+                f"请使用 claude_code_start 工具，在 {workspace} 中修复代码。\n"
                 f"上一轮修改未通过验收，以下是失败输出：\n"
                 f"```\n{output}\n```\n"
                 f"原始任务：{task_description}\n"
@@ -563,10 +564,10 @@ def execute_with_retry(workspace, task_description):
     return False, MAX_RETRIES
 
 # ---- 主流程 ----
-workspace = "~/.openclaw/workspaces/test-project"
+workspace = "/home/xiubao_li/.openclaw/workspaces/test-project"
 success, attempts = execute_with_retry(
     workspace,
-    "请实现 index.js 中的 uniqueArray 函数，使所有测试通过。运行 npm test 验证。"
+    "实现 index.js 中的 uniqueArray 函数，使 npm test 通过。"
 )
 ```
 
@@ -587,7 +588,7 @@ success, attempts = execute_with_retry(
       "id": "task-001",
       "name": "实现 uniqueArray",
       "description": "实现 index.js 中的 uniqueArray 函数，使所有测试通过",
-      "workspace": "~/.openclaw/workspaces/test-project",
+      "workspace": "/home/xiubao_li/.openclaw/workspaces/test-project",
       "status": "pending",
       "attempts": 0,
       "max_retries": 3,
@@ -599,7 +600,7 @@ success, attempts = execute_with_retry(
       "id": "task-002",
       "name": "添加 flattenArray 函数",
       "description": "在 index.js 中添加 flattenArray 函数，将嵌套数组展平为一维数组，并添加测试",
-      "workspace": "~/.openclaw/workspaces/test-project",
+      "workspace": "/home/xiubao_li/.openclaw/workspaces/test-project",
       "status": "pending",
       "attempts": 0,
       "max_retries": 3,
@@ -619,6 +620,7 @@ import time
 from datetime import datetime, timezone
 
 QUEUE_FILE = "tasks/queue.json"
+AGENT_ID = "main"
 
 def load_queue():
     with open(QUEUE_FILE, "r") as f:
@@ -628,32 +630,14 @@ def save_queue(queue):
     with open(QUEUE_FILE, "w") as f:
         json.dump(queue, f, indent=2, ensure_ascii=False)
 
-def claude_code_execute(workspace, prompt):
+def send_to_agent(message):
+    """通过 CLI 向 OpenClaw agent 发送消息"""
     result = subprocess.run([
-        "openclaw", "run",
-        "--plugin", "claude-code",
-        "--tool", "claude_code_start",
-        "--input", json.dumps({
-            "workspace": workspace,
-            "prompt": prompt,
-            "allowed_tools": ["read", "edit", "bash"]
-        })
-    ], capture_output=True, text=True)
-    return json.loads(result.stdout).get("job_id")
-
-def wait_for_completion(job_id, timeout=300):
-    for _ in range(timeout // 5):
-        result = subprocess.run([
-            "openclaw", "run",
-            "--plugin", "claude-code",
-            "--tool", "claude_code_status",
-            "--input", json.dumps({"job_id": job_id})
-        ], capture_output=True, text=True)
-        status = json.loads(result.stdout)
-        if status.get("state") in ("completed", "failed"):
-            return status
-        time.sleep(5)
-    return {"state": "timeout"}
+        "openclaw", "agent",
+        "--agent", AGENT_ID,
+        "--message", message
+    ], capture_output=True, text=True, timeout=600)
+    return result.stdout
 
 def run_verification(project_dir):
     result = subprocess.run(
@@ -664,7 +648,10 @@ def run_verification(project_dir):
 
 def process_task(task):
     """处理单个任务，带回修循环"""
-    prompt = task["description"]
+    prompt = (
+        f"请使用 claude_code_start 工具，在 {task['workspace']} 中完成：\n"
+        f"{task['description']}"
+    )
 
     while task["attempts"] < task["max_retries"]:
         task["attempts"] += 1
@@ -673,12 +660,8 @@ def process_task(task):
 
         print(f"\n[{task['id']}] 第 {task['attempts']}/{task['max_retries']} 轮")
 
-        job_id = claude_code_execute(task["workspace"], prompt)
-        status = wait_for_completion(job_id)
-
-        if status["state"] == "failed":
-            prompt = f"上一轮执行失败。原始任务：{task['description']}。请重试。"
-            continue
+        response = send_to_agent(prompt)
+        print(f"Agent: {response[:200]}...")
 
         passed, output = run_verification(task["workspace"])
 
@@ -689,7 +672,8 @@ def process_task(task):
             return True
         else:
             prompt = (
-                f"上一轮修改未通过验收：\n```\n{output}\n```\n"
+                f"请使用 claude_code_start 工具，在 {task['workspace']} 中修复代码。\n"
+                f"上一轮未通过验收：\n```\n{output}\n```\n"
                 f"原始任务：{task['description']}\n请修复。"
             )
 
@@ -717,49 +701,40 @@ for task in queue["tasks"]:
 
 ### v0.5 — 通知 + 人工介入入口
 
-**目标**：任务完成或失败时通知到 Slack/飞书，失败任务可等待人工审批后重试。
+**目标**：任务完成或失败时通知到 Telegram，失败任务可等待人工审批后重试。
 
-**Slack 通知脚本 `scripts/notify.sh`：**
+**Telegram 通知脚本 `scripts/notify_telegram.sh`：**
 
 ```bash
 #!/bin/bash
-# notify.sh - 发送通知到 Slack
-# 用法: ./scripts/notify.sh <channel> <message>
-# 前提: 设置环境变量 SLACK_WEBHOOK_URL
+# notify_telegram.sh - 发送通知到 Telegram
+# 用法: ./scripts/notify_telegram.sh <chat_id> <message>
+# 前提: 设置环境变量 TELEGRAM_BOT_TOKEN
 
-CHANNEL="${1:-general}"
+CHAT_ID="$1"
 MESSAGE="$2"
 
-if [ -z "$SLACK_WEBHOOK_URL" ]; then
-  echo "⚠️ SLACK_WEBHOOK_URL 未设置，跳过通知"
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+  echo "⚠️ TELEGRAM_BOT_TOKEN 未设置，跳过通知"
   echo "消息内容: $MESSAGE"
   exit 0
 fi
 
-curl -s -X POST "$SLACK_WEBHOOK_URL" \
-  -H 'Content-type: application/json' \
-  -d "{\"channel\": \"#${CHANNEL}\", \"text\": \"${MESSAGE}\"}"
+curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -H 'Content-Type: application/json' \
+  -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"${MESSAGE}\", \"parse_mode\": \"Markdown\"}"
 ```
 
-**飞书通知脚本 `scripts/notify_feishu.sh`：**
-
 ```bash
-#!/bin/bash
-# notify_feishu.sh - 发送通知到飞书
-# 用法: ./scripts/notify_feishu.sh <message>
-# 前提: 设置环境变量 FEISHU_WEBHOOK_URL
+# 配置环境变量（加入 ~/.bashrc）
+# TELEGRAM_BOT_TOKEN 就是 openclaw.json 中的 botToken
+# CHAT_ID 是你的 Telegram 用户 ID 或群组 ID
+# 获取 CHAT_ID：给 bot 发条消息，然后访问：
+#   https://api.telegram.org/bot<TOKEN>/getUpdates
+# 返回 JSON 中的 message.chat.id 就是 CHAT_ID
 
-MESSAGE="$1"
-
-if [ -z "$FEISHU_WEBHOOK_URL" ]; then
-  echo "⚠️ FEISHU_WEBHOOK_URL 未设置，跳过通知"
-  echo "消息内容: $MESSAGE"
-  exit 0
-fi
-
-curl -s -X POST "$FEISHU_WEBHOOK_URL" \
-  -H 'Content-Type: application/json' \
-  -d "{\"msg_type\": \"text\", \"content\": {\"text\": \"${MESSAGE}\"}}"
+export TELEGRAM_BOT_TOKEN="your-bot-token-here"
+export TELEGRAM_CHAT_ID="your-chat-id-here"
 ```
 
 **在编排脚本中集成通知和人工介入：**
@@ -769,12 +744,11 @@ curl -s -X POST "$FEISHU_WEBHOOK_URL" \
 
 import os
 
-def notify(message, channel="openclaw-tasks"):
-    """发送通知"""
-    # Slack
-    subprocess.run(["./scripts/notify.sh", channel, message])
-    # 飞书
-    subprocess.run(["./scripts/notify_feishu.sh", message])
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+def notify(message):
+    """发送 Telegram 通知"""
+    subprocess.run(["./scripts/notify_telegram.sh", TELEGRAM_CHAT_ID, message])
 
 def wait_for_human_approval(task_id):
     """等待人工审批（通过文件信号）"""
@@ -1058,8 +1032,7 @@ openclaw-claude-integration/
 ├── README.md                    # 本文件
 ├── scripts/
 │   ├── verify.sh                # 独立验收脚本
-│   ├── notify.sh                # Slack 通知
-│   ├── notify_feishu.sh         # 飞书通知
+│   ├── notify_telegram.sh       # Telegram 通知
 │   └── security_check.sh       # 安全检查脚本（建议每日 cron 运行）
 ├── tasks/
 │   ├── queue.json               # 任务队列（持久化）
