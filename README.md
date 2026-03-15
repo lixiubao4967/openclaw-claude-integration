@@ -16,57 +16,53 @@
 
 ## 架构设计
 
-### 四层模型
+### 端到端流水线
 
 ```
-┌──────────────────────────────────────────────────┐
-│  第一层：任务入口（OpenClaw）                       │
-│  Feishu / Slack / Discord / Issue / Cron 汇聚需求  │
-├──────────────────────────────────────────────────┤
-│  第二层：编排层（OpenClaw）                         │
-│  拆任务、记状态、决定重试或升级人工                    │
-├──────────────────────────────────────────────────┤
-│  第三层：执行层（Claude Code）                      │
-│  专注读 repo + 改码 + 验证 + 产出 diff              │
-├──────────────────────────────────────────────────┤
-│  第四层：验收与续航（独立判断）                       │
-│  lint / typecheck / test，"写代码"和"判定完成"必须拆开 │
-└──────────────────────────────────────────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   Telegram   │    │   OpenClaw   │    │  Claude Code │    │    CI/CD     │
+│   下发需求    │ ──→│   编排调度    │ ──→│ 写码+测试    │ ──→│  自动部署    │
+│              │    │              │    │ +commit+push │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+     你发消息          拆任务/派发          执行编码            检测到 push
+                      状态管理             跑测试             构建 + 部署
+                      失败通知             提交推送            发布上线
 ```
 
-### 凭据隔离模型（借鉴 n8n 模式）
-
-参考 [awesome-openclaw-usecases](https://github.com/hesamsheikh/awesome-openclaw-usecases) 中 n8n Workflow Orchestration 案例的核心思想：**凭据不进 agent，webhook 双向通信，每个任务独立隔离**。
+**完整流程：**
 
 ```
-┌─────────────────────────────────────────────────┐
-│  OpenClaw（编排层）                               │
-│  接收需求 → 拆分任务 → 调用插件工具触发执行          │
-│  ⚠️ 不持有任何 Claude 凭据                        │
-├─────────────────────────────────────────────────┤
-│  claude-code 插件（执行层，容器隔离）               │
-│  claude_code_start → 返回 job_id                 │
-│  claude_code_status → 轮询状态                    │
-│  claude_code_output → 获取结果                    │
-│  🔒 凭据仅通过容器挂载 ~/.claude/ 获取             │
-├─────────────────────────────────────────────────┤
-│  验收层（独立脚本，不在 Claude Code 内部）           │
-│  lint + typecheck + test → pass/fail             │
-├─────────────────────────────────────────────────┤
-│  通知层                                          │
-│  webhook 回调 → Slack / 飞书 通知结果              │
-└─────────────────────────────────────────────────┘
+你在 Telegram 发消息："给用户列表页加个搜索功能"
+  │
+  ▼
+OpenClaw（编排层）
+  ├── 理解需求，拆分任务
+  ├── 调用 claude_code_start 插件工具
+  └── 管理任务状态，失败时通知你
+  │
+  ▼
+Claude Code（执行层，容器内运行）
+  ├── 读取 repo 代码
+  ├── 实现功能
+  ├── 运行 npm test 确认通过
+  ├── git commit + git push
+  └── 🔒 凭据通过容器挂载 ~/.claude/ 获取，编排层不接触
+  │
+  ▼
+CI/CD（验收层）
+  ├── 检测到代码 push
+  ├── 运行 lint / typecheck / test / build
+  ├── 通过 → 自动部署
+  └── 失败 → 通知（可触发 OpenClaw 回修）
 ```
 
-### 最小闭环流程
+### 凭据隔离（借鉴 n8n 模式）
 
-```
-需求输入 → 任务拆分 → Claude Code 写代码 → 自动 review/verify
-  ↑                                                    ↓
-  ←── 不通过：回修（≤N轮） ←←←←←←←←←←←←←←←←←←←←←←←←←←
-  ←── 多轮失败：通知人工介入
-  ──→ 通过：进入下一任务
-```
+参考 [awesome-openclaw-usecases](https://github.com/hesamsheikh/awesome-openclaw-usecases) 中 n8n Workflow Orchestration 案例：**凭据不进 agent，每个任务独立隔离**。
+
+- OpenClaw 不持有 Claude 凭据，只负责编排
+- Claude Code 的 Team 账号凭据仅通过容器挂载传递
+- Git 推送凭据（SSH key / token）在 VM 内管理，不暴露给编排层
 
 ---
 
@@ -274,17 +270,15 @@ ls ~/.claude/.credentials.json
 
 ## 渐进式落地路线（详细实施）
 
-### v0.1 — 手动下发单任务，跑通链路
+### v0.1 — Telegram 下发任务，Claude Code 写码（已完成）
 
-**目标**：验证 OpenClaw → Claude Code → 产出代码 这条路能通。
+**目标**：验证 Telegram → OpenClaw → Claude Code → 产出代码 链路能通。
 
-**准备一个测试 repo：**
+**准备测试 repo：**
 
 ```bash
-# 在 workspaces 目录下创建一个测试项目
-mkdir -p ~/.openclaw/workspaces
-cd ~/.openclaw/workspaces
-mkdir test-project && cd test-project
+mkdir -p ~/.openclaw/workspaces/test-project
+cd ~/.openclaw/workspaces/test-project
 git init
 npm init -y
 
@@ -292,7 +286,7 @@ npm init -y
 git config --global user.email "you@example.com"
 git config --global user.name "Your Name"
 
-# 创建一个简单的文件让 Claude Code 去修改
+# 创建待实现的文件和测试
 cat > index.js << 'EOF'
 // TODO: 实现一个函数，接收数组，返回去重后的数组
 function uniqueArray(arr) {
@@ -302,7 +296,6 @@ function uniqueArray(arr) {
 module.exports = { uniqueArray };
 EOF
 
-# 创建测试文件
 cat > index.test.js << 'EOF'
 const { uniqueArray } = require('./index');
 
@@ -320,467 +313,204 @@ test('无重复', () => {
 EOF
 
 npm install --save-dev jest
-
-# 修改 package.json 的 test 脚本（npx json 首次运行会提示安装，输入 y 确认）
+# npx json 首次运行会提示安装，输入 y 确认
 npx json -I -f package.json -e 'this.scripts.test="jest"'
-
 git add -A && git commit -m "init: test project for openclaw integration"
 ```
 
-**通过 OpenClaw 下发任务：**
+**下发任务：**
 
-> **重要**：OpenClaw 没有 `openclaw run` 命令。插件工具（如 `claude_code_start`）是提供给 OpenClaw agent 使用的，需要通过向 agent 发消息来触发。
+> **重要**：OpenClaw 没有 `openclaw run` 命令。插件工具（如 `claude_code_start`）是由 OpenClaw agent 内部调用的，你只需向 agent 发送自然语言消息。
 
-有三种方式下发任务：
-
-**方式 A：通过 Telegram（推荐，最直观）**
-
-直接在 Telegram 中给你的 OpenClaw bot 发消息：
+在 Telegram 中给 OpenClaw bot 发消息：
 
 > 请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。
 
-**方式 B：通过 CLI**
+也可以通过 CLI 发：
 
 ```bash
 openclaw agent --agent main --message "请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
 ```
 
-**方式 C：通过 Gateway API（适合脚本调用）**
+**v0.1 通过标准**：Claude Code 成功修改代码，`npm test` 全部通过。**已验证通过。**
 
-```bash
-# Gateway 运行在本地端口（默认 18789），使用配置中的 token 认证
-GATEWAY_TOKEN="your-gateway-auth-token"
+---
 
-curl -s -X POST http://localhost:18789/api/v1/agent/main/message \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
-  -d '{
-    "message": "请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
-  }'
-```
+### v0.2 — Claude Code 自动 commit + push
 
-> Gateway API 的具体端点和格式请参考 `openclaw gateway --help` 和 [OpenClaw 文档](https://docs.openclaw.ai/cli)。上述为示例，实际端点可能略有不同。
+**目标**：Claude Code 完成编码后自动提交并推送代码，触发 CI/CD。
 
-**手动验证结果：**
+**前置：给测试项目配置 Git 远程仓库**
 
 ```bash
 cd ~/.openclaw/workspaces/test-project
-npm test          # 测试是否通过
-git diff          # 查看 Claude Code 做了什么改动
-git log --oneline # 查看是否有新 commit
+
+# 在 GitHub 上创建一个测试仓库，然后关联
+git remote add origin git@github.com:<your-username>/test-project.git
+
+# 配置 SSH key（如果还没有）
+ssh-keygen -t ed25519 -C "openclaw-worker"
+cat ~/.ssh/id_ed25519.pub
+# 将公钥添加到 GitHub（Settings → SSH keys）
+
+# 推送初始代码
+git push -u origin master
 ```
 
-**v0.1 通过标准**：Claude Code 成功修改了代码，`npm test` 全部通过。
+**下发任务时要求 commit + push：**
+
+在 Telegram 中发：
+
+> 在 /home/xiubao_li/.openclaw/workspaces/test-project 中添加一个 flattenArray 函数，将嵌套数组展平为一维数组。添加对应的测试。完成后运行 npm test 确认通过，然后 git commit 并 git push。
+
+Claude Code 会自动：
+1. 实现 flattenArray 函数
+2. 写测试
+3. 运行 `npm test`
+4. `git add` + `git commit` + `git push`
+
+**v0.2 通过标准**：Claude Code push 后，GitHub 仓库中能看到新的 commit。
 
 ---
 
-### v0.2 — 加自动验收脚本
+### v0.3 — 接入 CI/CD 自动部署
 
-**目标**：用独立脚本自动判断任务是否完成，不依赖 Claude Code 的自我判断。
+**目标**：Claude Code push 代码后，CI/CD 自动运行测试和部署。
 
-**创建验收脚本 `scripts/verify.sh`：**
+**GitHub Actions 示例 `.github/workflows/ci.yml`：**
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+      # 根据你的部署方式配置，例如：
+      # - 部署到服务器：rsync / ssh
+      # - 部署到云平台：AWS / Vercel / Cloudflare
+      # - 构建 Docker 镜像：docker build + push
+      - run: echo "部署步骤，根据实际项目配置"
+```
+
+**完整链路验证：**
+
+```
+Telegram 发任务
+  → OpenClaw 派发
+    → Claude Code 写码 + npm test + commit + push
+      → GitHub Actions 检测到 push
+        → 运行 lint + test
+          → 通过 → 自动部署
+          → 失败 → 通知（下一步 v0.4 处理）
+```
+
+**v0.3 通过标准**：Claude Code push 后，GitHub Actions 自动运行并部署成功。
+
+---
+
+### v0.4 — CI 失败时自动回修
+
+**目标**：CI/CD 失败时通知 OpenClaw，OpenClaw 让 Claude Code 回修，最多 3 轮。
+
+**方案 A：通过 GitHub Actions 回调 OpenClaw**
+
+在 CI 失败时通过 Telegram bot 通知，或直接调用 OpenClaw Gateway API 触发回修：
+
+```yaml
+# 在 ci.yml 的 test job 中添加失败处理
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm test
+      - name: 通知 CI 失败
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "chat_id": "${{ secrets.TELEGRAM_CHAT_ID }}",
+              "text": "CI 失败！请检查并修复。\n仓库: ${{ github.repository }}\n提交: ${{ github.sha }}\n日志: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+```
+
+**方案 B：OpenClaw cron 轮询 CI 状态**
 
 ```bash
-mkdir -p scripts
-cat > scripts/verify.sh << 'SCRIPT'
-#!/bin/bash
-# verify.sh - 独立于 Claude Code 的验收门
-# 用法: ./scripts/verify.sh <project-dir>
-# 返回: 0=通过, 1=失败
-
-set -euo pipefail
-
-PROJECT_DIR="${1:-.}"
-cd "$PROJECT_DIR"
-
-echo "========== 验收开始 =========="
-
-# 第一关：代码风格检查（如果配置了 lint）
-if grep -q '"lint"' package.json 2>/dev/null; then
-  echo "[1/3] 运行 lint..."
-  npm run lint || { echo "❌ lint 失败"; exit 1; }
-  echo "✅ lint 通过"
-else
-  echo "[1/3] 跳过 lint（未配置）"
-fi
-
-# 第二关：类型检查（如果配置了 typecheck）
-if grep -q '"typecheck"' package.json 2>/dev/null; then
-  echo "[2/3] 运行 typecheck..."
-  npm run typecheck || { echo "❌ typecheck 失败"; exit 1; }
-  echo "✅ typecheck 通过"
-else
-  echo "[2/3] 跳过 typecheck（未配置）"
-fi
-
-# 第三关：测试
-if grep -q '"test"' package.json 2>/dev/null; then
-  echo "[3/3] 运行测试..."
-  npm test || { echo "❌ 测试失败"; exit 1; }
-  echo "✅ 测试通过"
-else
-  echo "[3/3] ⚠️ 未配置测试，跳过"
-fi
-
-echo "========== 验收通过 =========="
-exit 0
-SCRIPT
-chmod +x scripts/verify.sh
+# 配置 OpenClaw 定时检查最近的 CI 状态
+openclaw cron add --schedule "*/5 * * * *" \
+  --agent main \
+  --message "检查 GitHub Actions 最近的运行状态，如果有失败的，分析失败原因并使用 claude_code_start 修复代码。"
 ```
 
-**在 OpenClaw 编排中调用验收：**
+**方案 C：手动通知回修（最简单）**
 
-```python
-# orchestrate_v02.py - v0.2 编排脚本
-# 通过 openclaw agent CLI 或 Gateway API 下发任务给 OpenClaw agent，
-# agent 会自动调用 claude_code_start 插件工具执行编码。
-import subprocess
-import json
-import time
+CI 失败后，你在 Telegram 中告诉 bot：
 
-# ---- 配置 ----
-AGENT_ID = "main"
-GATEWAY_PORT = 18789
-GATEWAY_TOKEN = "your-gateway-auth-token"  # 从 openclaw.json 的 gateway.auth.token 获取
+> CI 失败了，错误信息是 [粘贴错误]。请在 /home/xiubao_li/.openclaw/workspaces/test-project 中修复并重新 push。
 
-def send_to_agent(message):
-    """通过 CLI 向 OpenClaw agent 发送消息，返回 agent 回复"""
-    result = subprocess.run([
-        "openclaw", "agent",
-        "--agent", AGENT_ID,
-        "--message", message,
-        "--json"  # 如果支持 JSON 输出
-    ], capture_output=True, text=True, timeout=600)
-    return result.stdout
-
-def send_to_agent_via_api(message):
-    """通过 Gateway API 向 agent 发送消息（备选方案）"""
-    result = subprocess.run([
-        "curl", "-s", "-X", "POST",
-        f"http://localhost:{GATEWAY_PORT}/api/v1/agent/{AGENT_ID}/message",
-        "-H", "Content-Type: application/json",
-        "-H", f"Authorization: Bearer {GATEWAY_TOKEN}",
-        "-d", json.dumps({"message": message})
-    ], capture_output=True, text=True, timeout=600)
-    return result.stdout
-
-def run_verification(project_dir):
-    """运行独立验收脚本"""
-    result = subprocess.run(
-        ["./scripts/verify.sh", project_dir],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0, result.stdout
-
-# ---- 主流程 ----
-workspace = "/home/xiubao_li/.openclaw/workspaces/test-project"
-task_prompt = (
-    f"请使用 claude_code_start 工具，"
-    f"在 {workspace} 中实现 index.js 的 uniqueArray 函数，"
-    f"使 npm test 通过。"
-)
-
-# 1. 下发任务（通过 agent CLI）
-print("下发任务中...")
-response = send_to_agent(task_prompt)
-print(f"Agent 回复: {response}")
-
-# 2. 独立验收
-passed, output = run_verification(workspace)
-print(output)
-if passed:
-    print("✅ 验收通过")
-else:
-    print("❌ 验收失败，需要回修")
-```
-
-> **说明**：OpenClaw 的插件工具是由 agent 内部调用的，外部脚本只需向 agent 发送自然语言消息，agent 会自行决定调用 `claude_code_start` 等工具。Gateway API 的具体端点格式请参考 `openclaw gateway --help`。
-
-**v0.2 通过标准**：验收脚本能独立判断任务是否完成，不依赖 Claude Code 的输出。
+**v0.4 通过标准**：CI 失败后，通过某种方式触发 Claude Code 自动修复并重新 push，CI 最终通过。
 
 ---
 
-### v0.3 — 加失败回修循环
+### v0.5 — 实际项目接入
 
-**目标**：验收失败后自动将错误反馈给 Claude Code 重新修复，最多 3 轮。
+**目标**：将一个真实项目接入这套流水线。
 
-```python
-# orchestrate_v03.py - v0.3 编排脚本（带回修循环）
-import subprocess
-import json
-import time
-
-MAX_RETRIES = 3
-AGENT_ID = "main"
-
-def send_to_agent(message):
-    """通过 CLI 向 OpenClaw agent 发送消息"""
-    result = subprocess.run([
-        "openclaw", "agent",
-        "--agent", AGENT_ID,
-        "--message", message
-    ], capture_output=True, text=True, timeout=600)
-    return result.stdout
-
-def run_verification(project_dir):
-    result = subprocess.run(
-        ["./scripts/verify.sh", project_dir],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0, result.stdout + result.stderr
-
-def execute_with_retry(workspace, task_description):
-    """带回修循环的任务执行"""
-    prompt = (
-        f"请使用 claude_code_start 工具，在 {workspace} 中完成以下任务：\n"
-        f"{task_description}"
-    )
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        print(f"\n--- 第 {attempt}/{MAX_RETRIES} 轮 ---")
-
-        # 通过 agent 下发任务
-        response = send_to_agent(prompt)
-        print(f"Agent 回复: {response[:200]}...")
-
-        # 独立验收
-        passed, output = run_verification(workspace)
-
-        if passed:
-            print(f"✅ 第 {attempt} 轮验收通过！")
-            return True, attempt
-        else:
-            print(f"❌ 第 {attempt} 轮验收失败")
-            # 将失败信息作为反馈，构造回修 prompt
-            prompt = (
-                f"请使用 claude_code_start 工具，在 {workspace} 中修复代码。\n"
-                f"上一轮修改未通过验收，以下是失败输出：\n"
-                f"```\n{output}\n```\n"
-                f"原始任务：{task_description}\n"
-                f"请根据失败信息修复代码。"
-            )
-
-    print(f"⛔ {MAX_RETRIES} 轮回修均未通过，需要人工介入")
-    return False, MAX_RETRIES
-
-# ---- 主流程 ----
-workspace = "/home/xiubao_li/.openclaw/workspaces/test-project"
-success, attempts = execute_with_retry(
-    workspace,
-    "实现 index.js 中的 uniqueArray 函数，使 npm test 通过。"
-)
-```
-
-**v0.3 通过标准**：失败后能自动回修，且 3 轮内能收敛到通过。
-
----
-
-### v0.4 — 多任务队列 + 状态持久化
-
-**目标**：支持多个任务排队执行，任务状态持久化到文件，重启后可恢复。
-
-**任务队列文件 `tasks/queue.json`：**
-
-```json
-{
-  "tasks": [
-    {
-      "id": "task-001",
-      "name": "实现 uniqueArray",
-      "description": "实现 index.js 中的 uniqueArray 函数，使所有测试通过",
-      "workspace": "/home/xiubao_li/.openclaw/workspaces/test-project",
-      "status": "pending",
-      "attempts": 0,
-      "max_retries": 3,
-      "created_at": "2026-03-15T10:00:00Z",
-      "completed_at": null,
-      "error": null
-    },
-    {
-      "id": "task-002",
-      "name": "添加 flattenArray 函数",
-      "description": "在 index.js 中添加 flattenArray 函数，将嵌套数组展平为一维数组，并添加测试",
-      "workspace": "/home/xiubao_li/.openclaw/workspaces/test-project",
-      "status": "pending",
-      "attempts": 0,
-      "max_retries": 3,
-      "created_at": "2026-03-15T10:01:00Z",
-      "completed_at": null,
-      "error": null
-    }
-  ]
-}
-```
-
-```python
-# orchestrate_v04.py - v0.4 编排脚本（多任务队列 + 持久化）
-import subprocess
-import json
-import time
-from datetime import datetime, timezone
-
-QUEUE_FILE = "tasks/queue.json"
-AGENT_ID = "main"
-
-def load_queue():
-    with open(QUEUE_FILE, "r") as f:
-        return json.load(f)
-
-def save_queue(queue):
-    with open(QUEUE_FILE, "w") as f:
-        json.dump(queue, f, indent=2, ensure_ascii=False)
-
-def send_to_agent(message):
-    """通过 CLI 向 OpenClaw agent 发送消息"""
-    result = subprocess.run([
-        "openclaw", "agent",
-        "--agent", AGENT_ID,
-        "--message", message
-    ], capture_output=True, text=True, timeout=600)
-    return result.stdout
-
-def run_verification(project_dir):
-    result = subprocess.run(
-        ["./scripts/verify.sh", project_dir],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0, result.stdout + result.stderr
-
-def process_task(task):
-    """处理单个任务，带回修循环"""
-    prompt = (
-        f"请使用 claude_code_start 工具，在 {task['workspace']} 中完成：\n"
-        f"{task['description']}"
-    )
-
-    while task["attempts"] < task["max_retries"]:
-        task["attempts"] += 1
-        task["status"] = "running"
-        save_queue(load_queue())  # 持久化状态
-
-        print(f"\n[{task['id']}] 第 {task['attempts']}/{task['max_retries']} 轮")
-
-        response = send_to_agent(prompt)
-        print(f"Agent: {response[:200]}...")
-
-        passed, output = run_verification(task["workspace"])
-
-        if passed:
-            task["status"] = "completed"
-            task["completed_at"] = datetime.now(timezone.utc).isoformat()
-            print(f"✅ [{task['id']}] 完成")
-            return True
-        else:
-            prompt = (
-                f"请使用 claude_code_start 工具，在 {task['workspace']} 中修复代码。\n"
-                f"上一轮未通过验收：\n```\n{output}\n```\n"
-                f"原始任务：{task['description']}\n请修复。"
-            )
-
-    task["status"] = "failed"
-    task["error"] = "超过最大重试次数"
-    print(f"⛔ [{task['id']}] 失败，需要人工介入")
-    return False
-
-# ---- 主流程：依次处理队列中的 pending 任务 ----
-queue = load_queue()
-
-for task in queue["tasks"]:
-    if task["status"] == "pending":
-        process_task(task)
-        save_queue(queue)  # 每个任务完成后持久化
-
-print("\n========== 队列处理完毕 ==========")
-for task in queue["tasks"]:
-    print(f"  [{task['id']}] {task['name']}: {task['status']}")
-```
-
-**v0.4 通过标准**：多个任务能排队执行，中途重启后从 queue.json 恢复继续。
-
----
-
-### v0.5 — 通知 + 人工介入入口
-
-**目标**：任务完成或失败时通知到 Telegram，失败任务可等待人工审批后重试。
-
-**Telegram 通知脚本 `scripts/notify_telegram.sh`：**
+**步骤：**
 
 ```bash
-#!/bin/bash
-# notify_telegram.sh - 发送通知到 Telegram
-# 用法: ./scripts/notify_telegram.sh <chat_id> <message>
-# 前提: 设置环境变量 TELEGRAM_BOT_TOKEN
+# 1. Clone 你的实际项目到 workspaces
+cd ~/.openclaw/workspaces
+git clone git@github.com:<your-org>/<your-project>.git
+cd <your-project>
 
-CHAT_ID="$1"
-MESSAGE="$2"
+# 2. 确认项目有测试和 CI 配置
+cat package.json | grep -A5 '"scripts"'
+ls .github/workflows/
 
-if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
-  echo "⚠️ TELEGRAM_BOT_TOKEN 未设置，跳过通知"
-  echo "消息内容: $MESSAGE"
-  exit 0
-fi
-
-curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  -H 'Content-Type: application/json' \
-  -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"${MESSAGE}\", \"parse_mode\": \"Markdown\"}"
+# 3. 通过 Telegram 下发真实任务
 ```
 
-```bash
-# 配置环境变量（加入 ~/.bashrc）
-# TELEGRAM_BOT_TOKEN 就是 openclaw.json 中的 botToken
-# CHAT_ID 是你的 Telegram 用户 ID 或群组 ID
-# 获取 CHAT_ID：给 bot 发条消息，然后访问：
-#   https://api.telegram.org/bot<TOKEN>/getUpdates
-# 返回 JSON 中的 message.chat.id 就是 CHAT_ID
+在 Telegram 中发实际需求：
 
-export TELEGRAM_BOT_TOKEN="your-bot-token-here"
-export TELEGRAM_CHAT_ID="your-chat-id-here"
-```
+> 在 /home/xiubao_li/.openclaw/workspaces/<your-project> 中，给用户列表页添加搜索功能。搜索应该支持按用户名和邮箱模糊匹配。完成后运行测试，确认通过后 commit 并 push。
 
-**在编排脚本中集成通知和人工介入：**
-
-```python
-# 在 orchestrate_v04.py 基础上添加
-
-import os
-
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-def notify(message):
-    """发送 Telegram 通知"""
-    subprocess.run(["./scripts/notify_telegram.sh", TELEGRAM_CHAT_ID, message])
-
-def wait_for_human_approval(task_id):
-    """等待人工审批（通过文件信号）"""
-    approval_file = f"tasks/approvals/{task_id}.approved"
-    print(f"⏳ 等待人工审批，创建 {approval_file} 文件以继续...")
-    notify(f"任务 {task_id} 需要人工介入，审批后创建 {approval_file} 继续")
-
-    while not os.path.exists(approval_file):
-        time.sleep(10)
-
-    os.remove(approval_file)
-    print(f"✅ 收到人工审批，继续执行")
-
-# 修改 process_task 的失败分支：
-# if task["status"] == "failed":
-#     notify(f"⛔ 任务 [{task['id']}] {task['name']} 失败，需要人工介入")
-#     wait_for_human_approval(task["id"])
-#     task["status"] = "pending"  # 重置状态，等待下一轮
-#     task["attempts"] = 0
-```
-
-**v0.5 通过标准**：失败任务能发出通知，人工确认后可重新执行。
+**v0.5 通过标准**：真实项目的功能需求通过 Telegram → OpenClaw → Claude Code → CI/CD 完整流水线交付。
 
 ---
 
 ## 关键原则
 
-- **执行层最优 ≠ 系统层最优** — 不要让 Claude Code 同时当 PM、QA、调度器
-- **"写代码"和"判定完成"必须拆开** — 不让 coder 自己宣布"我修好了"
-- **凭据不进 agent** — 借鉴 n8n 模式，Claude 凭据只通过容器挂载传递，编排层不接触
-- **第一版别追求全自动** — 先跑通最小闭环，再逐步加自动化
-- **完成条件必须机器可判断** — lint、typecheck、测试、review approval、最大重试次数
+- **各层各司其职** — OpenClaw 编排调度，Claude Code 写码测试提交，CI/CD 验收部署
+- **CI/CD 是验收层** — 不需要额外验收脚本，CI 通过 = 可部署，CI 失败 = 需回修
+- **凭据不进 agent** — Claude 凭据通过容器挂载传递，Git SSH key 在 VM 内管理，编排层不接触
+- **Telegram 是控制面板** — 下发需求、接收通知、触发回修，全在 Telegram 里完成
+- **先通后优** — v0.1 跑通链路，v0.2 加 push，v0.3 接 CI/CD，逐步完善
 
 ---
 
@@ -1029,20 +759,17 @@ chmod +x scripts/security_check.sh
 
 ```
 openclaw-claude-integration/
-├── README.md                    # 本文件
+├── README.md                        # 本文件（架构设计 + 搭建指南 + 落地路线）
 ├── scripts/
-│   ├── verify.sh                # 独立验收脚本
-│   ├── notify_telegram.sh       # Telegram 通知
-│   └── security_check.sh       # 安全检查脚本（建议每日 cron 运行）
-├── tasks/
-│   ├── queue.json               # 任务队列（持久化）
-│   └── approvals/               # 人工审批信号目录
-├── orchestrate_v02.py           # v0.2 编排脚本
-├── orchestrate_v03.py           # v0.3 编排脚本（带回修）
-├── orchestrate_v04.py           # v0.4 编排脚本（多任务+持久化）
+│   └── security_check.sh           # 安全检查脚本（建议每日 cron 运行）
+├── .github/
+│   └── workflows/
+│       └── ci.yml                   # CI/CD 配置（v0.3 阶段创建）
 └── .openclaw/
-    └── openclaw.json            # OpenClaw 插件配置
+    └── openclaw.json                # OpenClaw 插件配置（在 VM 中）
 ```
+
+> 注意：这套方案不需要额外的编排脚本或任务队列文件。OpenClaw agent 本身就是编排器，通过 Telegram 交互即可完成所有调度。CI/CD 就是验收层。
 
 ---
 
