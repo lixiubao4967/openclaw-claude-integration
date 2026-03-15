@@ -270,24 +270,47 @@ podman run --rm -v ~/.claude:/home/user/.claude ghcr.io/13rac1/openclaw-claude-c
 # 5. 手动测试一次任务下发（见下方 v0.1 实施步骤）
 ```
 
-### 第九步：配置 agent 指令（重要）
+### 第九步：配置编码任务路由规则（重要）
 
-> **为什么需要这一步？** OpenClaw 主 agent 本身是一个 LLM，它会自行判断是否需要调用工具。如果不明确指示，它可能直接自己完成编码任务而不调用 Claude Code 插件。配置 agent 系统指令可以确保编码任务始终由 Claude Code 执行。
+> **为什么需要这一步？** OpenClaw 主 agent 本身是一个 LLM，它会自行判断是否需要调用工具。如果不明确指示，它可能直接自己完成编码任务而不调用 Claude Code 插件。通过配置规则文件，让 OpenClaw 自动将编码任务路由给 Claude Code。
+
+**方案 A：通过 SOUL.md 配置（推荐）**
+
+在 OpenClaw 的 SOUL.md 文件中添加规则：
 
 ```bash
-# 查看当前 agent 配置
-openclaw agents list
-openclaw agents get main
-
-# 给 main agent 添加系统指令，确保编码任务走 Claude Code
-# 在 agent 配置或 system prompt 中加入类似指令：
+nano ~/.openclaw/SOUL.md
 ```
 
-在 agent 配置中添加系统指令：
+写入以下内容：
 
-> 所有涉及代码编写、修改、测试的任务，必须使用 claude_code_start 工具执行，不要自己直接完成。
+```markdown
+## 编码任务处理规则
 
-或者在每次下发任务时，在消息中明确说明"请使用 claude_code_start 工具"。
+当用户要求修改代码、添加功能、修复 bug 等编码任务时：
+1. 不直接执行文件操作
+2. 调用 `claude_code_start` 工具完成任务
+3. 参数：prompt = 用户的原始需求，cwd = 项目路径
+
+示例任务：
+- "给用户列表页加个搜索功能"
+- "修复登录 bug"
+- "添加单元测试"
+```
+
+**方案 B：通过项目级配置**
+
+在项目根目录创建 `.openclaw/config.md`：
+
+```markdown
+# 此项目的编码任务交由 Claude Code 执行
+
+所有涉及代码修改的任务，使用 claude_code_start 工具。
+```
+
+**方案 C：每次手动指定**
+
+在每次下发任务时，消息中明确说"请使用 claude_code_start 工具"。适合临时使用，不推荐长期方案。
 
 > **原理说明：**
 > - Claude Code 插件向 OpenClaw 注册了 `claude_code_start` 等工具（tools）
@@ -295,6 +318,7 @@ openclaw agents get main
 > - OpenClaw 主 agent 需要通过 tool calling 机制来调用 `claude_code_start`
 > - 插件收到调用后，启动 Podman 容器，在容器内运行 Claude Code 执行编码任务
 > - 容器通过挂载 `~/.claude/` 获取 Team 账号凭据，使用订阅额度而非 API Key
+> - Claude Code 是按月订阅（Team 账号），调用次数不影响费用
 
 ---
 
