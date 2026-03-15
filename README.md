@@ -122,14 +122,14 @@ sudo apt install -y curl git build-essential
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
 
-# 安装 Docker（OrbStack VM 中用 Docker 即可）
-sudo apt install -y docker.io
-sudo usermod -aG docker $USER
-newgrp docker
+# 安装 Podman（Claude Code 插件需要 Podman，不是 Docker）
+sudo apt install -y podman
+# 如果 apt 版本过旧，可用官方源安装最新版：
+# https://podman.io/docs/installation#linux-distributions
 
 # 验证
 node --version   # 应 >= 20.x
-docker --version
+podman --version
 git --version
 ```
 
@@ -181,11 +181,11 @@ claude "echo hello"  # 简单测试，确认能正常响应
 # 安装插件
 openclaw plugins install @13rac1/openclaw-plugin-claude-code
 
-# 拉取 Claude Code 容器镜像
-docker pull ghcr.io/13rac1/openclaw-claude-code:latest
+# 拉取 Claude Code 容器镜像（使用 Podman）
+podman pull ghcr.io/13rac1/openclaw-claude-code:latest
 
 # 验证镜像
-docker images | grep openclaw-claude-code
+podman images | grep openclaw-claude-code
 ```
 
 ### 第六步：配置插件
@@ -210,14 +210,14 @@ nano ~/.openclaw/openclaw.json
         "enabled": true,
         "config": {
           "image": "ghcr.io/13rac1/openclaw-claude-code:latest",
-          "runtime": "docker",
+          "runtime": "podman",
           "startupTimeout": 30,
           "idleTimeout": 300,
           "memory": "1g",
           "cpus": "2.0",
           "network": "bridge",
           "sessionsDir": "~/.openclaw/claude-sessions",
-          "workspacesDir": "~/.openclaw/workspaces"
+          "workspacesDir": "~/Github"
         }
       }
     }
@@ -229,14 +229,14 @@ nano ~/.openclaw/openclaw.json
 
 | 字段 | 说明 | 建议值 |
 |------|------|--------|
-| `runtime` | 容器运行时，OrbStack VM 中用 docker | `"docker"` |
+| `runtime` | 容器运行时，插件需要 Podman | `"podman"` |
 | `startupTimeout` | 容器启动超时（秒） | `30` |
 | `idleTimeout` | 空闲会话自动清理时间（秒） | `300`（5 分钟） |
 | `memory` | 单个容器内存上限 | `"1g"`（复杂任务可调到 `"2g"`） |
 | `cpus` | 单个容器 CPU 核心数 | `"2.0"` |
 | `network` | 网络模式，bridge 允许容器访问外网（拉依赖等） | `"bridge"` |
 | `sessionsDir` | 会话持久化目录 | `"~/.openclaw/claude-sessions"` |
-| `workspacesDir` | 工作区目录，存放 clone 的 repo | `"~/.openclaw/workspaces"` |
+| `workspacesDir` | 工作区目录，存放 clone 的 repo | `"~/Github"` |
 
 ### 第七步：配置 webhook 通知（可选，v0.5 再做）
 
@@ -257,14 +257,44 @@ openclaw status
 
 # 2. 确认插件已加载
 openclaw plugins list
-# 应看到 claude-code 插件状态为 enabled
+# 应看到 claude-code 插件状态为 loaded
 
 # 3. 确认 Claude Code 认证有效
 ls ~/.claude/.credentials.json
 # 文件应存在
 
-# 4. 手动测试一次任务下发（见下方 v0.1 实施步骤）
+# 4. 手动测试容器能否启动 Claude Code
+podman run --rm -v ~/.claude:/home/user/.claude ghcr.io/13rac1/openclaw-claude-code:latest claude --version
+# 应输出 Claude Code 版本号
+
+# 5. 手动测试一次任务下发（见下方 v0.1 实施步骤）
 ```
+
+### 第九步：配置 agent 指令（重要）
+
+> **为什么需要这一步？** OpenClaw 主 agent 本身是一个 LLM，它会自行判断是否需要调用工具。如果不明确指示，它可能直接自己完成编码任务而不调用 Claude Code 插件。配置 agent 系统指令可以确保编码任务始终由 Claude Code 执行。
+
+```bash
+# 查看当前 agent 配置
+openclaw agents list
+openclaw agents get main
+
+# 给 main agent 添加系统指令，确保编码任务走 Claude Code
+# 在 agent 配置或 system prompt 中加入类似指令：
+```
+
+在 agent 配置中添加系统指令：
+
+> 所有涉及代码编写、修改、测试的任务，必须使用 claude_code_start 工具执行，不要自己直接完成。
+
+或者在每次下发任务时，在消息中明确说明"请使用 claude_code_start 工具"。
+
+> **原理说明：**
+> - Claude Code 插件向 OpenClaw 注册了 `claude_code_start` 等工具（tools）
+> - 插件不是 ACP agent，不走 ACPX 运行时（ACPX 只支持 codex/pi/openclaw 等 agent）
+> - OpenClaw 主 agent 需要通过 tool calling 机制来调用 `claude_code_start`
+> - 插件收到调用后，启动 Podman 容器，在容器内运行 Claude Code 执行编码任务
+> - 容器通过挂载 `~/.claude/` 获取 Team 账号凭据，使用订阅额度而非 API Key
 
 ---
 
@@ -277,9 +307,12 @@ ls ~/.claude/.credentials.json
 **准备测试 repo：**
 
 ```bash
-mkdir -p ~/.openclaw/workspaces/test-project
-cd ~/.openclaw/workspaces/test-project
-git init
+mkdir -p ~/Github
+cd ~/Github
+# 在 GitHub 上创建一个测试仓库，然后 clone
+git clone git@github.com:<your-username>/<test-project>.git
+cd <test-project>
+
 npm init -y
 
 # ⚠️ VM 全新环境需要配置 git 身份（否则无法 commit）
@@ -316,52 +349,57 @@ npm install --save-dev jest
 # npx json 首次运行会提示安装，输入 y 确认
 npx json -I -f package.json -e 'this.scripts.test="jest"'
 git add -A && git commit -m "init: test project for openclaw integration"
+git push -u origin master
 ```
 
 **下发任务：**
 
-> **重要**：OpenClaw 没有 `openclaw run` 命令。插件工具（如 `claude_code_start`）是由 OpenClaw agent 内部调用的，你只需向 agent 发送自然语言消息。
+> **重要**：OpenClaw 没有 `openclaw run` 命令。插件工具（如 `claude_code_start`）是由 OpenClaw agent 内部调用的，你只需向 agent 发送自然语言消息。但**必须明确说明使用 `claude_code_start` 工具**，否则 OpenClaw 可能跳过插件自己完成任务。
 
 在 Telegram 中给 OpenClaw bot 发消息：
 
-> 请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。
+> 请使用 claude_code_start 工具，在 /home/xiubao_li/Github/\<test-project\> 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。
 
 也可以通过 CLI 发：
 
 ```bash
-openclaw agent --agent main --message "请使用 claude_code_start 工具，在 /home/xiubao_li/.openclaw/workspaces/test-project 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
+openclaw agent --agent main --message "请使用 claude_code_start 工具，在 /home/xiubao_li/Github/<test-project> 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
 ```
 
-**v0.1 通过标准**：Claude Code 成功修改代码，`npm test` 全部通过。**已验证通过。**
+**如何验证确实调用了 Claude Code（而非 OpenClaw 自己完成）：**
+
+```bash
+# 检查是否有 Podman 容器运行记录
+podman ps -a | grep openclaw-claude-code
+
+# 检查 OpenClaw 回复中是否出现 "🧩 Sessions Yield" 或 "Sub-agent" 字样
+# 如果出现 "ACP 运行时未配置，所以我直接完成了任务" 则说明没有调用 Claude Code
+```
+
+**v0.1 通过标准**：Claude Code（在 Podman 容器中）成功修改代码，`npm test` 全部通过。**已验证通过。**
 
 ---
 
-### v0.2 — Claude Code 自动 commit + push
+### v0.2 — Claude Code 自动 commit + push（已完成）
 
 **目标**：Claude Code 完成编码后自动提交并推送代码，触发 CI/CD。
 
-**前置：给测试项目配置 Git 远程仓库**
+**前置：配置 SSH key（如果 v0.1 还没做）**
 
 ```bash
-cd ~/.openclaw/workspaces/test-project
-
-# 在 GitHub 上创建一个测试仓库，然后关联
-git remote add origin git@github.com:<your-username>/test-project.git
-
-# 配置 SSH key（如果还没有）
+# 配置 SSH key
 ssh-keygen -t ed25519 -C "openclaw-worker"
 cat ~/.ssh/id_ed25519.pub
 # 将公钥添加到 GitHub（Settings → SSH keys）
-
-# 推送初始代码
-git push -u origin master
 ```
+
+> v0.1 已经在 `~/Github` 中 clone 了测试仓库并 push 了初始代码，这里直接下发任务。
 
 **下发任务时要求 commit + push：**
 
 在 Telegram 中发：
 
-> 在 /home/xiubao_li/.openclaw/workspaces/test-project 中添加一个 flattenArray 函数，将嵌套数组展平为一维数组。添加对应的测试。完成后运行 npm test 确认通过，然后 git commit 并 git push。
+> 请使用 claude_code_start 工具，在 /home/xiubao_li/Github/\<test-project\> 中添加一个 flattenArray 函数，将嵌套数组展平为一维数组。添加对应的测试。完成后运行 npm test 确认通过，然后 git commit 并 git push。
 
 Claude Code 会自动：
 1. 实现 flattenArray 函数
@@ -369,7 +407,7 @@ Claude Code 会自动：
 3. 运行 `npm test`
 4. `git add` + `git commit` + `git push`
 
-**v0.2 通过标准**：Claude Code push 后，GitHub 仓库中能看到新的 commit。
+**v0.2 通过标准**：Claude Code push 后，GitHub 仓库中能看到新的 commit。**已验证通过。**
 
 ---
 
@@ -484,8 +522,8 @@ CI 失败后，你在 Telegram 中告诉 bot：
 **步骤：**
 
 ```bash
-# 1. Clone 你的实际项目到 workspaces
-cd ~/.openclaw/workspaces
+# 1. Clone 你的实际项目到工作区
+cd ~/Github
 git clone git@github.com:<your-org>/<your-project>.git
 cd <your-project>
 
@@ -498,7 +536,7 @@ ls .github/workflows/
 
 在 Telegram 中发实际需求：
 
-> 在 /home/xiubao_li/.openclaw/workspaces/<your-project> 中，给用户列表页添加搜索功能。搜索应该支持按用户名和邮箱模糊匹配。完成后运行测试，确认通过后 commit 并 push。
+> 请使用 claude_code_start 工具，在 /home/xiubao_li/Github/\<your-project\> 中，给用户列表页添加搜索功能。搜索应该支持按用户名和邮箱模糊匹配。完成后运行测试，确认通过后 commit 并 push。
 
 **v0.5 通过标准**：真实项目的功能需求通过 Telegram → OpenClaw → Claude Code → CI/CD 完整流水线交付。
 
@@ -591,21 +629,12 @@ openclaw plugins uninstall <plugin-name>
 --cap-drop ALL（丢弃所有 Linux 能力） ✅ 插件默认
 内存/CPU/PID 限制                    ✅ openclaw.json 中配置
 tmpfs /tmp（nosuid）                 ✅ 插件默认
-rootless 运行（如果用 Podman）       ⚠️ OrbStack 用 Docker，建议额外加固
+rootless 运行（Podman 默认支持）      ✅ Podman 天然 rootless
 ```
 
-**额外加固 Docker 运行时：**
+**Podman 的安全优势：**
 
-```bash
-# 创建专用用户运行 OpenClaw（不用 root）
-sudo useradd -m -s /bin/bash openclaw-runner
-sudo usermod -aG docker openclaw-runner
-
-# 切换到专用用户
-su - openclaw-runner
-
-# 后续所有操作都在 openclaw-runner 用户下进行
-```
+Podman 天然以 rootless 模式运行，不需要 daemon 进程，比 Docker 更安全。无需额外创建专用用户。
 
 #### 5. 凭据保护
 
@@ -703,7 +732,7 @@ echo "  运行 openclaw config list 查看"
 
 # 5. 容器运行状态
 echo "[5/6] 容器检查..."
-RUNNING_CONTAINERS=$(docker ps --filter "ancestor=ghcr.io/13rac1/openclaw-claude-code" --format "{{.ID}} {{.Status}}" 2>/dev/null)
+RUNNING_CONTAINERS=$(podman ps --filter "ancestor=ghcr.io/13rac1/openclaw-claude-code" --format "{{.ID}} {{.Status}}" 2>/dev/null)
 if [ -n "$RUNNING_CONTAINERS" ]; then
   echo "  运行中的 Claude Code 容器:"
   echo "$RUNNING_CONTAINERS" | while read line; do echo "    $line"; done
@@ -749,9 +778,48 @@ chmod +x scripts/security_check.sh
 | 技能来源 | ClawdHub（未审计） | 手动审计，仅本地 | 仅用已审计插件，不用 ClawdHub |
 | 凭据管理 | 可能分散 | 集中管理 | 容器挂载，编排层不接触 |
 | 网络暴露 | 多端口多服务 | SSH only（Tailscale） | OrbStack 内网，按需开放 |
-| 爆炸半径 | agent 可访问的一切 | 沙盒限于项目目录 | 容器 --cap-drop ALL + 资源限制 |
+| 爆炸半径 | agent 可访问的一切 | 沙盒限于项目目录 | Podman rootless + --cap-drop ALL + 资源限制 |
 
 **本项目的额外优势**：OrbStack VM 本身就是一层隔离，即使容器被突破，攻击者仍在 VM 内，无法直接触及宿主 macOS。
+
+---
+
+## 踩坑记录与排障指南
+
+### 问题 1：OpenClaw 自己完成编码任务，不调用 Claude Code
+
+**现象**：下发编码任务后，OpenClaw 直接自己写代码，回复中出现"ACP 运行时（Claude Code）未配置，所以我直接完成了任务"。`podman ps` 没有容器运行记录。
+
+**原因**：OpenClaw 主 agent 本身是一个 LLM，它会自行判断是否需要调用工具。如果不明确说明，它可能认为自己能完成任务而跳过 `claude_code_start` 工具。
+
+**解决**：
+1. 下发任务时明确说"请使用 claude_code_start 工具"
+2. 或配置 main agent 的系统指令（见第九步）
+
+### 问题 2：ACPX Runtime 与 Claude Code 插件的关系
+
+**结论：二者无关。**
+
+| 组件 | 作用 | 支持的 agent |
+|------|------|-------------|
+| **ACPX Runtime** | OpenClaw 内置的通用 ACP 运行时 | codex、pi、openclaw 等 |
+| **Claude Code 插件** | 第三方插件，提供 `claude_code_start` 等工具 | 不是 ACP agent，通过 tool calling 调用 |
+
+不需要启用 ACPX Runtime 来使用 Claude Code 插件。不要用 `sessions_spawn` + `runtime="acp"` + `agentId="claude-code"` 的组合，这是错误的。
+
+### 问题 3：插件需要 Podman 而非 Docker
+
+**现象**：插件配置了 `"runtime": "docker"` 但容器从未启动。
+
+**原因**：`@13rac1/openclaw-plugin-claude-code` 插件使用 Podman 容器运行时，不是 Docker。
+
+**解决**：安装 Podman，配置中 `runtime` 设为 `"podman"`。
+
+### 问题 4：插件 ID 不匹配警告
+
+**现象**：`plugins.entries.claude-code: plugin id mismatch (manifest uses "claude-code", entry hints "openclaw-plugin-claude-code")`
+
+**结论**：此警告不影响功能，可忽略。是 npm 包名与插件 manifest ID 不一致导致的。
 
 ---
 
