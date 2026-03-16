@@ -382,12 +382,12 @@ git push -u origin master
 
 在 Telegram 中给 OpenClaw bot 发消息：
 
-> 请使用 claude_code_start 工具，在 /home/xiubao_li/Github/\<test-project\> 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。
+> 请使用 claude_code_start 工具，在 /home/<your-user>/Github/\<test-project\> 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。
 
 也可以通过 CLI 发：
 
 ```bash
-openclaw agent --agent main --message "请使用 claude_code_start 工具，在 /home/xiubao_li/Github/<test-project> 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
+openclaw agent --agent main --message "请使用 claude_code_start 工具，在 /home/<your-user>/Github/<test-project> 中实现 index.js 的 uniqueArray 函数，使 npm test 通过。"
 ```
 
 **如何验证确实调用了 Claude Code（而非 OpenClaw 自己完成）：**
@@ -423,7 +423,7 @@ cat ~/.ssh/id_ed25519.pub
 
 在 Telegram 中发：
 
-> 请使用 claude_code_start 工具，在 /home/xiubao_li/Github/\<test-project\> 中添加一个 flattenArray 函数，将嵌套数组展平为一维数组。添加对应的测试。完成后运行 npm test 确认通过，然后 git commit 并 git push。
+> 请使用 claude_code_start 工具，在 /home/<your-user>/Github/\<test-project\> 中添加一个 flattenArray 函数，将嵌套数组展平为一维数组。添加对应的测试。完成后运行 npm test 确认通过，然后 git commit 并 git push。
 
 Claude Code 会自动：
 1. 实现 flattenArray 函数
@@ -560,7 +560,7 @@ ls .github/workflows/
 
 在 Telegram 中发实际需求：
 
-> 请使用 claude_code_start 工具，在 /home/xiubao_li/Github/\<your-project\> 中，给用户列表页添加搜索功能。搜索应该支持按用户名和邮箱模糊匹配。完成后运行测试，确认通过后 commit 并 push。
+> 请使用 claude_code_start 工具，在 /home/<your-user>/Github/\<your-project\> 中，给用户列表页添加搜索功能。搜索应该支持按用户名和邮箱模糊匹配。完成后运行测试，确认通过后 commit 并 push。
 
 **v0.5 通过标准**：真实项目的功能需求通过 Telegram → OpenClaw → Claude Code → CI/CD 完整流水线交付。
 
